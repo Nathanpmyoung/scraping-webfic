@@ -88,8 +88,13 @@ class PatreonScraper:
 
         raise ValueError(f"Could not find campaign ID for {self.creator_slug}")
 
-    def fetch_posts(self, limit: int = 100) -> list:
-        """Fetch posts from the creator's campaign."""
+    def fetch_posts(self, limit: int = 100, full_content: bool = False) -> list:
+        """Fetch posts from the creator's campaign.
+
+        Args:
+            limit: Maximum number of posts to fetch
+            full_content: If True, fetch full content by visiting each post URL
+        """
         campaign_id = self.get_campaign_id()
 
         posts = []
@@ -136,6 +141,20 @@ class PatreonScraper:
 
             # Rate limiting
             time.sleep(0.5)
+
+        # If full_content requested, fetch each post's full page
+        if full_content:
+            print(f"Fetching full content for {len(posts[:limit])} posts...")
+            for i, post in enumerate(posts[:limit], 1):
+                if post.get('url'):
+                    try:
+                        print(f"  [{i}/{len(posts[:limit])}] Fetching: {post['title']}")
+                        full_post = self.fetch_post_from_url(post['url'])
+                        if full_post and full_post.get('content'):
+                            post['content'] = full_post['content']
+                        time.sleep(1)  # Be nice to the server
+                    except Exception as e:
+                        print(f"    Warning: Could not fetch full content: {e}")
 
         return posts[:limit]
 
@@ -185,6 +204,58 @@ class PatreonScraper:
 
         data = response.json()
         return self._parse_post(data.get("data", {}))
+
+    def fetch_post_from_url(self, post_url: str) -> Optional[dict]:
+        """Fetch a post by visiting its URL and scraping the full content."""
+        response = self.session.get(post_url)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Find the post content in the page
+        # Patreon embeds post data in JSON within script tags
+        post_data = None
+        for script in soup.find_all('script'):
+            if script.string and 'window.patreon' in script.string:
+                # Try to extract JSON data
+                match = re.search(r'Object\.assign\(window\.patreon\.bootstrap,\s*({.*?})\s*\);', script.string, re.DOTALL)
+                if match:
+                    try:
+                        json_str = match.group(1)
+                        data = json.loads(json_str)
+
+                        # Navigate through the data structure to find the post
+                        if 'post' in data and 'data' in data['post']:
+                            post_data = data['post']['data']
+                            break
+                    except json.JSONDecodeError:
+                        continue
+
+        if post_data:
+            return self._parse_post(post_data)
+
+        # Fallback: try to scrape content directly from HTML
+        content_div = soup.find('div', {'data-tag': 'post-content'})
+        if not content_div:
+            content_div = soup.find('div', class_=re.compile(r'post.*content', re.I))
+
+        if content_div:
+            content_html = str(content_div)
+            content_text = self.h2t.handle(content_html).strip()
+
+            # Try to find title
+            title_elem = soup.find('h1')
+            title = title_elem.get_text().strip() if title_elem else "Untitled"
+
+            return {
+                "title": title,
+                "content": content_text,
+                "date": "",
+                "url": post_url,
+                "type": "text",
+            }
+
+        return None
 
 
 def save_posts_as_text(posts: list, output_dir: str, single_file: bool = True):
@@ -291,6 +362,11 @@ Examples:
         help="Save each post as a separate file instead of combining"
     )
     parser.add_argument(
+        "--full-content",
+        action="store_true",
+        help="Fetch full content by visiting each post URL (slower but more complete)"
+    )
+    parser.add_argument(
         "--help-session",
         action="store_true",
         help="Show instructions for getting your session_id"
@@ -327,7 +403,7 @@ Examples:
                 print(f"\n{post['content']}")
         else:
             print(f"Fetching up to {args.limit} posts...")
-            posts = scraper.fetch_posts(limit=args.limit)
+            posts = scraper.fetch_posts(limit=args.limit, full_content=args.full_content)
             print(f"Found {len(posts)} posts")
 
             if posts:
